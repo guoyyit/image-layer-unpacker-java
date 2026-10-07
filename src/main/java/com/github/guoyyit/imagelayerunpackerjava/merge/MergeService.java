@@ -6,9 +6,13 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.springframework.stereotype.Service;
 
@@ -25,6 +29,7 @@ public class MergeService {
     public static final String TYPE_OTHER = "other";
 
     private final LayerManager layerManager;
+    private final AtomicReference<MergedView> viewCache = new AtomicReference<>();
 
     public MergeService(LayerManager layerManager) {
         this.layerManager = layerManager;
@@ -54,6 +59,18 @@ public class MergeService {
         }
     }
 
+    private static final class Leaf {
+        private final String type;
+        private final long size;
+        private final Path physical;
+
+        private Leaf(String type, long size, Path physical) {
+            this.type = type;
+            this.size = size;
+            this.physical = physical;
+        }
+    }
+
     private static final class Resolved {
         private final String type;
         private final long size;
@@ -66,12 +83,32 @@ public class MergeService {
         }
     }
 
+    /**
+     * Immutable merged view of one registry version. A whiteout hiding a
+     * directory covers the directory itself and every descendant path, so the
+     * view is computed by sweeping layers from top to bottom while carrying the
+     * set of covered prefixes; visible directories are exactly the ancestors of
+     * visible leaf entries, which keeps hidden subtrees (and their empty shell
+     * ancestors) out of every read path.
+     */
+    private static final class MergedView {
+        private final long version;
+        private final Map<String, Leaf> leaves;
+        private final Set<String> directories;
+
+        private MergedView(long version, Map<String, Leaf> leaves, Set<String> directories) {
+            this.version = version;
+            this.leaves = leaves;
+            this.directories = directories;
+        }
+    }
+
     public List<MergeNode> listDirectory(String path) throws IOException {
         String normalized = normalizeViewPath(path);
         return layerManager.withSnapshot(snapshot -> {
-            List<LayerRecord> layers = sortedLayers(snapshot);
+            MergedView view = view(snapshot);
             if (!normalized.isEmpty()) {
-                Resolved resolved = resolve(snapshot, layers, normalized);
+                Resolved resolved = resolve(view, normalized);
                 if (resolved == null) {
                     throw new ApiException.NotFound("path not found in merged view: " + path);
                 }
@@ -79,7 +116,7 @@ public class MergeService {
                     throw new ApiException.BadRequest("path is not a directory: " + path);
                 }
             }
-            return listMergedDirectory(snapshot, layers, normalized);
+            return listMergedDirectory(view, normalized);
         });
     }
 
@@ -89,8 +126,8 @@ public class MergeService {
             throw new ApiException.BadRequest("root is not a file");
         }
         return layerManager.withSnapshot(snapshot -> {
-            List<LayerRecord> layers = sortedLayers(snapshot);
-            Resolved resolved = resolve(snapshot, layers, normalized);
+            MergedView view = view(snapshot);
+            Resolved resolved = resolve(view, normalized);
             if (resolved == null) {
                 throw new ApiException.NotFound("path not found in merged view: " + path);
             }
@@ -104,11 +141,11 @@ public class MergeService {
     public MergeNode stat(String path) throws IOException {
         String normalized = normalizeViewPath(path);
         return layerManager.withSnapshot(snapshot -> {
-            List<LayerRecord> layers = sortedLayers(snapshot);
+            MergedView view = view(snapshot);
             if (normalized.isEmpty()) {
                 return new MergeNode("", TYPE_DIRECTORY, 0);
             }
-            Resolved resolved = resolve(snapshot, layers, normalized);
+            Resolved resolved = resolve(view, normalized);
             if (resolved == null) {
                 throw new ApiException.NotFound("path not found in merged view: " + path);
             }
@@ -116,110 +153,122 @@ public class MergeService {
         });
     }
 
-    private List<MergeNode> listMergedDirectory(LayerManager.Snapshot snapshot,
-            List<LayerRecord> layers, String dirPath) throws IOException {
-        java.util.TreeSet<String> childNames = new java.util.TreeSet<>();
-        String childPrefix = dirPath.isEmpty() ? "" : dirPath + "/";
-        for (LayerRecord layer : layers) {
-            for (String path : layer.getPaths()) {
-                if (!path.startsWith(childPrefix) || path.length() <= childPrefix.length()) {
-                    continue;
-                }
-                String rest = path.substring(childPrefix.length());
-                int slash = rest.indexOf('/');
-                String childName = slash < 0 ? rest : rest.substring(0, slash);
-                if (!childName.startsWith(".wh.")) {
-                    childNames.add(childName);
-                }
-            }
+    private MergedView view(LayerManager.Snapshot snapshot) throws IOException {
+        long version = snapshot.getVersion();
+        MergedView cached = viewCache.get();
+        if (cached != null && cached.version == version) {
+            return cached;
         }
-        List<MergeNode> result = new ArrayList<>();
-        for (String childName : childNames) {
-            String childPath = dirPath.isEmpty() ? childName : dirPath + "/" + childName;
-            Resolved resolved = resolve(snapshot, layers, childPath);
-            if (resolved != null) {
-                result.add(new MergeNode("/" + childPath, resolved.type, resolved.size));
-            }
+        MergedView built = buildView(snapshot, version);
+        MergedView current = viewCache.get();
+        if (current == null || built.version >= current.version) {
+            viewCache.compareAndSet(current, built);
         }
-        return result;
+        return built;
     }
 
-    private Resolved resolve(LayerManager.Snapshot snapshot, List<LayerRecord> layers,
-            String viewPath) throws IOException {
-        String prefix = viewPath + "/";
-        int owner = -1;
+    private MergedView buildView(LayerManager.Snapshot snapshot, long version) throws IOException {
+        List<LayerRecord> layers = sortedLayers(snapshot);
+        Map<String, Leaf> leaves = new LinkedHashMap<>();
+        Set<String> claimed = new HashSet<>();
+        Set<String> covered = new HashSet<>();
+        Set<String> opaque = new HashSet<>();
         for (int i = layers.size() - 1; i >= 0; i--) {
             LayerRecord layer = layers.get(i);
-            if (removedByLayer(layer, viewPath)) {
-                return null;
-            }
-            Path layerRoot = snapshot.layerRoot(layer.getId());
-            Path physical = layerRoot.resolve(viewPath);
-            if (Files.exists(physical, LinkOption.NOFOLLOW_LINKS)) {
-                owner = i;
-                break;
-            }
-            if (layerContainsDirectoryEntry(layer, viewPath, prefix)) {
-                owner = i;
-                break;
-            }
-        }
-        if (owner < 0) {
-            return null;
-        }
-        for (int i = owner + 1; i < layers.size(); i++) {
-            if (opaqueIn(layers.get(i), viewPath)) {
-                return null;
-            }
-        }
-        LayerRecord ownerLayer = layers.get(owner);
-        Path layerRoot = snapshot.layerRoot(ownerLayer.getId()).toAbsolutePath().normalize();
-        Path physical = layerRoot.resolve(viewPath).normalize();
-        if (!physical.startsWith(layerRoot)) {
-            throw new ApiException.UnsafeArchive(
-                    "resolved path escapes layer root: " + viewPath);
-        }
-        if (Files.exists(physical, LinkOption.NOFOLLOW_LINKS)) {
-                String type = entryType(physical);
-                if (TYPE_OTHER.equals(type)) {
-                    return null;
+            Path layerRoot = snapshot.layerRoot(layer.getId()).toAbsolutePath().normalize();
+            for (String path : layer.getPaths()) {
+                if (!claimed.add(path)) {
+                    continue;
                 }
-                long size = TYPE_FILE.equals(type)
-                        && Files.isRegularFile(physical, LinkOption.NOFOLLOW_LINKS)
-                                ? Files.size(physical)
-                                : 0;
-                return new Resolved(type, size, physical);
+                if (isCovered(path, covered, opaque)) {
+                    continue;
+                }
+                Path physical = layerRoot.resolve(path).normalize();
+                if (!physical.startsWith(layerRoot)) {
+                    throw new ApiException.UnsafeArchive(
+                            "resolved path escapes layer root: " + path);
+                }
+                if (!Files.exists(physical, LinkOption.NOFOLLOW_LINKS)) {
+                    continue;
+                }
+                String type = entryType(physical);
+                if (TYPE_DIRECTORY.equals(type) || TYPE_OTHER.equals(type)) {
+                    continue;
+                }
+                long size = TYPE_FILE.equals(type) ? Files.size(physical) : 0;
+                leaves.put(path, new Leaf(type, size, physical));
+            }
+            covered.addAll(layer.getWhiteouts());
+            opaque.addAll(layer.getOpaqueDirs());
         }
-        return new Resolved(TYPE_DIRECTORY, 0, null);
-    }
-
-    private boolean layerContainsDirectoryEntry(LayerRecord layer, String dirPath, String prefix) {
-        List<String> paths = layer.getPaths();
-        if (paths.contains(dirPath)) {
-            return true;
-        }
-        for (String candidate : paths) {
-            if (candidate.startsWith(prefix)) {
-                return true;
+        Set<String> directories = new HashSet<>();
+        for (String leafPath : leaves.keySet()) {
+            String parent = parentOf(leafPath);
+            while (parent != null && directories.add(parent)) {
+                parent = parentOf(parent);
             }
         }
-        return false;
+        directories.removeAll(leaves.keySet());
+        return new MergedView(version, leaves, directories);
     }
 
-    private boolean removedByLayer(LayerRecord layer, String path) {
-        if (layer.getWhiteouts().contains(path)) {
+    private static boolean isCovered(String path, Set<String> covered, Set<String> opaque) {
+        if (covered.contains(path)) {
             return true;
         }
+        String parent = parentOf(path);
+        while (parent != null) {
+            if (covered.contains(parent) || opaque.contains(parent)) {
+                return true;
+            }
+            parent = parentOf(parent);
+        }
         return false;
     }
 
-    private boolean opaqueIn(LayerRecord layer, String childPath) {
-        for (String opaqueDir : layer.getOpaqueDirs()) {
-            if (childPath.startsWith(opaqueDir + "/")) {
-                return true;
+    private Resolved resolve(MergedView view, String viewPath) {
+        Leaf leaf = view.leaves.get(viewPath);
+        if (leaf != null) {
+            return new Resolved(leaf.type, leaf.size, leaf.physical);
+        }
+        if (view.directories.contains(viewPath)) {
+            return new Resolved(TYPE_DIRECTORY, 0, null);
+        }
+        return null;
+    }
+
+    private List<MergeNode> listMergedDirectory(MergedView view, String dirPath) {
+        Map<String, MergeNode> children = new TreeMap<>();
+        for (Map.Entry<String, Leaf> entry : view.leaves.entrySet()) {
+            String childPath = entry.getKey();
+            if (isDirectChild(childPath, dirPath)) {
+                Leaf leaf = entry.getValue();
+                children.put(childPath, new MergeNode("/" + childPath, leaf.type, leaf.size));
             }
         }
-        return false;
+        for (String childPath : view.directories) {
+            if (isDirectChild(childPath, dirPath)) {
+                children.putIfAbsent(childPath,
+                        new MergeNode("/" + childPath, TYPE_DIRECTORY, 0));
+            }
+        }
+        return new ArrayList<>(children.values());
+    }
+
+    private static boolean isDirectChild(String path, String dirPath) {
+        if (dirPath.isEmpty()) {
+            return path.indexOf('/') < 0;
+        }
+        if (!path.startsWith(dirPath) || path.length() <= dirPath.length()
+                || path.charAt(dirPath.length()) != '/') {
+            return false;
+        }
+        return path.indexOf('/', dirPath.length() + 1) < 0;
+    }
+
+    private static String parentOf(String path) {
+        int index = path.lastIndexOf('/');
+        return index < 0 ? null : path.substring(0, index);
     }
 
     private static String entryType(Path path) {

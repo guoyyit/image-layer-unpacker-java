@@ -90,6 +90,53 @@ class HttpApiTests {
     }
 
     @Test
+    void directoryWhiteoutHidesSubtreeOverHttp() throws Exception {
+        byte[] base = TarBuilder.create()
+                .directory("web")
+                .directory("web/assets")
+                .file("web/assets/app.js", "js-content")
+                .file("web/index.html", "index")
+                .build();
+        byte[] upper = TarBuilder.create().whiteout("web", "assets").build();
+        try {
+            mockMvc.perform(post("/api/layers/http-wh-base")
+                            .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                            .content(base))
+                    .andExpect(status().isOk());
+            mockMvc.perform(post("/api/layers/http-wh-upper")
+                            .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                            .content(upper))
+                    .andExpect(status().isOk());
+
+            mockMvc.perform(get("/api/view/stat").param("path", "/web/assets"))
+                    .andExpect(status().isNotFound());
+            mockMvc.perform(get("/api/view/stat").param("path", "/web/assets/app.js"))
+                    .andExpect(status().isNotFound());
+            mockMvc.perform(get("/api/view/read").param("path", "/web/assets/app.js"))
+                    .andExpect(status().isNotFound());
+            mockMvc.perform(get("/api/view/list").param("path", "/web/assets"))
+                    .andExpect(status().isNotFound());
+
+            mockMvc.perform(get("/api/view/stat").param("path", "/web"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.type").value("directory"));
+            mockMvc.perform(get("/api/view/list").param("path", "/web"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$[0].path").value("/web/index.html"))
+                    .andExpect(jsonPath("$[1]").doesNotExist());
+            mockMvc.perform(get("/api/view/read").param("path", "/web/index.html"))
+                    .andExpect(status().isOk())
+                    .andExpect(content().bytes("index".getBytes()));
+        } finally {
+            mockMvc.perform(delete("/api/layers/http-wh-upper"));
+            mockMvc.perform(delete("/api/layers/http-wh-base"));
+        }
+
+        mockMvc.perform(get("/api/view/stat").param("path", "/web"))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
     void invalidIdReturnsBadRequest() throws Exception {
         mockMvc.perform(post("/api/layers/..%2Fevil")
                         .contentType(MediaType.APPLICATION_OCTET_STREAM)

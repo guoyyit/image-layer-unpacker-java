@@ -21,6 +21,7 @@ import com.github.guoyyit.imagelayerunpackerjava.storage.StorageLayout;
 import com.github.guoyyit.imagelayerunpackerjava.unpack.UnpackService;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ConcurrencyTests {
@@ -176,6 +177,136 @@ class ConcurrencyTests {
         executor.shutdown();
         assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
         assertEquals(0, failures.get());
+    }
+
+    @Test
+    void readsStaySelfConsistentWhileDirectoryWhiteoutLayerIsDeleted() throws Exception {
+        layerManager.submit("base", new ByteArrayInputStream(
+                TarBuilder.create()
+                        .file("data/deep/file.txt", "base-content")
+                        .file("top.txt", "top")
+                        .build()));
+        layerManager.submit("wiper", new ByteArrayInputStream(
+                TarBuilder.create().whiteout("", "data").build()));
+
+        AtomicInteger hiddenReads = new AtomicInteger();
+        AtomicInteger visibleReads = new AtomicInteger();
+        AtomicInteger failures = new AtomicInteger();
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch sawHidden = new CountDownLatch(5);
+        CountDownLatch sawVisible = new CountDownLatch(5);
+        for (int i = 0; i < 4; i++) {
+            executor.submit(() -> {
+                try {
+                    start.await();
+                    while (sawVisible.getCount() > 0) {
+                        try {
+                            String value = read("data/deep/file.txt");
+                            if (!"base-content".equals(value)) {
+                                failures.incrementAndGet();
+                            } else {
+                                visibleReads.incrementAndGet();
+                                sawVisible.countDown();
+                            }
+                        } catch (com.github.guoyyit.imagelayerunpackerjava.error.ApiException
+                                .NotFound expected) {
+                            hiddenReads.incrementAndGet();
+                            sawHidden.countDown();
+                        }
+                        mergeService.listDirectory("/");
+                    }
+                } catch (Exception e) {
+                    failures.incrementAndGet();
+                }
+            });
+        }
+        executor.submit(() -> {
+            try {
+                start.await();
+                if (sawHidden.await(20, TimeUnit.SECONDS)) {
+                    layerManager.delete("wiper");
+                } else {
+                    failures.incrementAndGet();
+                }
+            } catch (Exception e) {
+                failures.incrementAndGet();
+            }
+        });
+        start.countDown();
+
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
+        assertEquals(0, failures.get());
+        assertTrue(hiddenReads.get() > 0);
+        assertTrue(visibleReads.get() > 0);
+        assertEquals("base-content", read("data/deep/file.txt"));
+        assertEquals("directory", mergeService.stat("data").getType());
+    }
+
+    @Test
+    void readsStaySelfConsistentWhileDirectoryWhiteoutLayerIsUnpacked() throws Exception {
+        layerManager.submit("base", new ByteArrayInputStream(
+                TarBuilder.create()
+                        .file("data/deep/file.txt", "base-content")
+                        .file("top.txt", "top")
+                        .build()));
+
+        AtomicInteger hiddenReads = new AtomicInteger();
+        AtomicInteger visibleReads = new AtomicInteger();
+        AtomicInteger failures = new AtomicInteger();
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch sawVisible = new CountDownLatch(5);
+        CountDownLatch sawHidden = new CountDownLatch(5);
+        for (int i = 0; i < 4; i++) {
+            executor.submit(() -> {
+                try {
+                    start.await();
+                    while (sawHidden.getCount() > 0) {
+                        try {
+                            String value = read("data/deep/file.txt");
+                            if (!"base-content".equals(value)) {
+                                failures.incrementAndGet();
+                            } else {
+                                visibleReads.incrementAndGet();
+                                sawVisible.countDown();
+                            }
+                        } catch (com.github.guoyyit.imagelayerunpackerjava.error.ApiException
+                                .NotFound expected) {
+                            hiddenReads.incrementAndGet();
+                            sawHidden.countDown();
+                        }
+                        mergeService.listDirectory("/");
+                        mergeService.stat("top.txt");
+                    }
+                } catch (Exception e) {
+                    failures.incrementAndGet();
+                }
+            });
+        }
+        executor.submit(() -> {
+            try {
+                start.await();
+                if (sawVisible.await(20, TimeUnit.SECONDS)) {
+                    layerManager.submit("wiper", new ByteArrayInputStream(
+                            TarBuilder.create().whiteout("", "data").build()));
+                } else {
+                    failures.incrementAndGet();
+                }
+            } catch (Exception e) {
+                failures.incrementAndGet();
+            }
+        });
+        start.countDown();
+
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
+        assertEquals(0, failures.get());
+        assertTrue(hiddenReads.get() > 0);
+        assertTrue(visibleReads.get() > 0);
+        assertThrows(
+                com.github.guoyyit.imagelayerunpackerjava.error.ApiException.NotFound.class,
+                () -> mergeService.stat("data"));
+        assertEquals("top", read("top.txt"));
     }
 
     private boolean exists(String path) throws Exception {

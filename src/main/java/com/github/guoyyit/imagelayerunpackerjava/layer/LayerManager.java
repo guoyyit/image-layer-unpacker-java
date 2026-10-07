@@ -42,6 +42,7 @@ public class LayerManager {
     private final Map<String, Object> inFlight = new ConcurrentHashMap<>();
     private long nextSequence = 1;
     private long totalUnpackedBytes;
+    private long viewVersion;
 
     public LayerManager(StorageLayout layout, UnpackService unpackService,
             ServiceProperties properties) {
@@ -56,10 +57,12 @@ public class LayerManager {
     public static final class Snapshot {
         private final List<LayerRecord> layers;
         private final StorageLayout layout;
+        private final long version;
 
-        Snapshot(List<LayerRecord> layers, StorageLayout layout) {
+        Snapshot(List<LayerRecord> layers, StorageLayout layout, long version) {
             this.layers = layers;
             this.layout = layout;
+            this.version = version;
         }
 
         public List<LayerRecord> getLayers() {
@@ -68,6 +71,10 @@ public class LayerManager {
 
         public Path layerRoot(String id) {
             return layout.layerRoot(id);
+        }
+
+        public long getVersion() {
+            return version;
         }
     }
 
@@ -189,6 +196,7 @@ public class LayerManager {
             record.setPaths(new ArrayList<>(report.getPaths()));
             writeMeta(record);
             committed.put(id, record);
+            viewVersion++;
             totalUnpackedBytes = baseline + report.getUnpackedBytes();
             persistRegistry();
             return copy(record);
@@ -231,6 +239,7 @@ public class LayerManager {
             if (record == null) {
                 throw new ApiException.NotFound("layer not found: " + id);
             }
+            viewVersion++;
             totalUnpackedBytes -= record.getUnpackedBytes();
             if (totalUnpackedBytes < 0) {
                 totalUnpackedBytes = 0;
@@ -239,6 +248,7 @@ public class LayerManager {
                 deleteRecursively(layout.layerDir(id));
             } catch (IOException e) {
                 committed.put(id, record);
+                viewVersion++;
                 totalUnpackedBytes += record.getUnpackedBytes();
                 throw new ApiException(
                         org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR,
@@ -257,7 +267,8 @@ public class LayerManager {
         rwLock.readLock().lock();
         try {
             Snapshot snapshot = new Snapshot(
-                    committed.values().stream().map(LayerManager::copy).toList(), layout);
+                    committed.values().stream().map(LayerManager::copy).toList(), layout,
+                    viewVersion);
             return action.apply(snapshot);
         } finally {
             rwLock.readLock().unlock();
