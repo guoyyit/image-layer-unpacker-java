@@ -96,4 +96,53 @@ class HttpApiTests {
                         .content(new byte[] {1, 2}))
                 .andExpect(status().is4xxClientError());
     }
+
+    @Test
+    void directoryWhiteoutHidesSubtreeOnEveryViewEndpoint() throws Exception {
+        byte[] base = TarBuilder.create()
+                .file("svc/config/db.yml", "db")
+                .file("svc/config/nested/deep.txt", "deep")
+                .file("svc/live.txt", "live")
+                .build();
+        byte[] wiper = TarBuilder.create()
+                .whiteout("svc", "config")
+                .build();
+
+        mockMvc.perform(post("/api/layers/http-base")
+                        .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                        .content(base))
+                .andExpect(status().isOk());
+        mockMvc.perform(post("/api/layers/http-wiper")
+                        .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                        .content(wiper))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(get("/api/view/read").param("path", "/svc/config/db.yml"))
+                .andExpect(status().isNotFound());
+        mockMvc.perform(get("/api/view/read").param("path", "/svc/config/nested/deep.txt"))
+                .andExpect(status().isNotFound());
+        mockMvc.perform(get("/api/view/stat").param("path", "/svc/config"))
+                .andExpect(status().isNotFound());
+        mockMvc.perform(get("/api/view/stat").param("path", "/svc/config/nested"))
+                .andExpect(status().isNotFound());
+        mockMvc.perform(get("/api/view/list").param("path", "/svc/config"))
+                .andExpect(status().isNotFound());
+
+        mockMvc.perform(get("/api/view/list").param("path", "/svc"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].path").value("/svc/live.txt"));
+
+        mockMvc.perform(get("/api/view/read").param("path", "/svc/live.txt"))
+                .andExpect(status().isOk())
+                .andExpect(content().bytes("live".getBytes()));
+
+        mockMvc.perform(delete("/api/layers/http-wiper"))
+                .andExpect(status().isNoContent());
+        mockMvc.perform(get("/api/view/read").param("path", "/svc/config/db.yml"))
+                .andExpect(status().isOk())
+                .andExpect(content().bytes("db".getBytes()));
+        mockMvc.perform(delete("/api/layers/http-base"))
+                .andExpect(status().isNoContent());
+    }
 }

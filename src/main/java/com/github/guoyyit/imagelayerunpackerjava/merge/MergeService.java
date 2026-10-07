@@ -6,9 +6,12 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 
 import org.springframework.stereotype.Service;
 
@@ -70,8 +73,9 @@ public class MergeService {
         String normalized = normalizeViewPath(path);
         return layerManager.withSnapshot(snapshot -> {
             List<LayerRecord> layers = sortedLayers(snapshot);
+            MergedView view = MergedView.build(layers);
             if (!normalized.isEmpty()) {
-                Resolved resolved = resolve(snapshot, layers, normalized);
+                Resolved resolved = resolve(snapshot, layers, view, normalized);
                 if (resolved == null) {
                     throw new ApiException.NotFound("path not found in merged view: " + path);
                 }
@@ -79,7 +83,7 @@ public class MergeService {
                     throw new ApiException.BadRequest("path is not a directory: " + path);
                 }
             }
-            return listMergedDirectory(snapshot, layers, normalized);
+            return listMergedDirectory(snapshot, layers, view, normalized);
         });
     }
 
@@ -90,7 +94,8 @@ public class MergeService {
         }
         return layerManager.withSnapshot(snapshot -> {
             List<LayerRecord> layers = sortedLayers(snapshot);
-            Resolved resolved = resolve(snapshot, layers, normalized);
+            MergedView view = MergedView.build(layers);
+            Resolved resolved = resolve(snapshot, layers, view, normalized);
             if (resolved == null) {
                 throw new ApiException.NotFound("path not found in merged view: " + path);
             }
@@ -105,10 +110,11 @@ public class MergeService {
         String normalized = normalizeViewPath(path);
         return layerManager.withSnapshot(snapshot -> {
             List<LayerRecord> layers = sortedLayers(snapshot);
+            MergedView view = MergedView.build(layers);
             if (normalized.isEmpty()) {
                 return new MergeNode("", TYPE_DIRECTORY, 0);
             }
-            Resolved resolved = resolve(snapshot, layers, normalized);
+            Resolved resolved = resolve(snapshot, layers, view, normalized);
             if (resolved == null) {
                 throw new ApiException.NotFound("path not found in merged view: " + path);
             }
@@ -117,26 +123,24 @@ public class MergeService {
     }
 
     private List<MergeNode> listMergedDirectory(LayerManager.Snapshot snapshot,
-            List<LayerRecord> layers, String dirPath) throws IOException {
-        java.util.TreeSet<String> childNames = new java.util.TreeSet<>();
+            List<LayerRecord> layers, MergedView view, String dirPath) throws IOException {
+        TreeSet<String> childNames = new TreeSet<>();
         String childPrefix = dirPath.isEmpty() ? "" : dirPath + "/";
-        for (LayerRecord layer : layers) {
-            for (String path : layer.getPaths()) {
-                if (!path.startsWith(childPrefix) || path.length() <= childPrefix.length()) {
-                    continue;
-                }
-                String rest = path.substring(childPrefix.length());
-                int slash = rest.indexOf('/');
-                String childName = slash < 0 ? rest : rest.substring(0, slash);
-                if (!childName.startsWith(".wh.")) {
-                    childNames.add(childName);
-                }
+        for (String path : view.paths()) {
+            if (!path.startsWith(childPrefix) || path.length() <= childPrefix.length()) {
+                continue;
+            }
+            String rest = path.substring(childPrefix.length());
+            int slash = rest.indexOf('/');
+            String childName = slash < 0 ? rest : rest.substring(0, slash);
+            if (!childName.startsWith(".wh.")) {
+                childNames.add(childName);
             }
         }
         List<MergeNode> result = new ArrayList<>();
         for (String childName : childNames) {
             String childPath = dirPath.isEmpty() ? childName : dirPath + "/" + childName;
-            Resolved resolved = resolve(snapshot, layers, childPath);
+            Resolved resolved = resolve(snapshot, layers, view, childPath);
             if (resolved != null) {
                 result.add(new MergeNode("/" + childPath, resolved.type, resolved.size));
             }
@@ -145,81 +149,127 @@ public class MergeService {
     }
 
     private Resolved resolve(LayerManager.Snapshot snapshot, List<LayerRecord> layers,
-            String viewPath) throws IOException {
-        String prefix = viewPath + "/";
-        int owner = -1;
-        for (int i = layers.size() - 1; i >= 0; i--) {
-            LayerRecord layer = layers.get(i);
-            if (removedByLayer(layer, viewPath)) {
-                return null;
-            }
-            Path layerRoot = snapshot.layerRoot(layer.getId());
-            Path physical = layerRoot.resolve(viewPath);
-            if (Files.exists(physical, LinkOption.NOFOLLOW_LINKS)) {
-                owner = i;
-                break;
-            }
-            if (layerContainsDirectoryEntry(layer, viewPath, prefix)) {
-                owner = i;
-                break;
-            }
-        }
-        if (owner < 0) {
+            MergedView view, String viewPath) throws IOException {
+        Integer ownerIndex = view.owner(viewPath);
+        if (ownerIndex == null) {
             return null;
         }
-        for (int i = owner + 1; i < layers.size(); i++) {
-            if (opaqueIn(layers.get(i), viewPath)) {
-                return null;
-            }
-        }
-        LayerRecord ownerLayer = layers.get(owner);
+        LayerRecord ownerLayer = layers.get(ownerIndex);
         Path layerRoot = snapshot.layerRoot(ownerLayer.getId()).toAbsolutePath().normalize();
         Path physical = layerRoot.resolve(viewPath).normalize();
         if (!physical.startsWith(layerRoot)) {
             throw new ApiException.UnsafeArchive(
                     "resolved path escapes layer root: " + viewPath);
         }
+        String type;
+        long size = 0;
+        Path physicalResult = physical;
         if (Files.exists(physical, LinkOption.NOFOLLOW_LINKS)) {
-                String type = entryType(physical);
-                if (TYPE_OTHER.equals(type)) {
-                    return null;
+            type = entryType(physical);
+            if (TYPE_OTHER.equals(type)) {
+                return null;
+            }
+            if (TYPE_FILE.equals(type)) {
+                size = Files.size(physical);
+            }
+        } else {
+            type = TYPE_DIRECTORY;
+            physicalResult = null;
+        }
+        if (TYPE_DIRECTORY.equals(type) && !view.hasVisibleDescendant(viewPath)) {
+            return null;
+        }
+        return new Resolved(type, size, physicalResult);
+    }
+
+    /**
+     * Visibility model computed once per request from a consistent snapshot of the
+     * layer stack. A whiteout entry hides not only its exact target path but the
+     * whole subtree beneath it in every lower layer; an opaque marker hides only
+     * the strict descendants of its directory in lower layers. Markers of a layer
+     * never hide entries of the same layer, so a higher (or the same) layer may
+     * recreate a path that a lower-aimed whiteout removed.
+     */
+    private static final class MergedView {
+        private final Map<String, Integer> ownerByPath;
+        private Set<String> nonEmptyDirs;
+
+        private MergedView(Map<String, Integer> ownerByPath) {
+            this.ownerByPath = ownerByPath;
+        }
+
+        static MergedView build(List<LayerRecord> layers) {
+            Map<String, Integer> owner = new HashMap<>();
+            Set<String> whiteouts = new HashSet<>();
+            Set<String> opaqueDirs = new HashSet<>();
+            for (int i = layers.size() - 1; i >= 0; i--) {
+                LayerRecord layer = layers.get(i);
+                for (String path : layer.getPaths()) {
+                    if (!owner.containsKey(path) && !isHidden(whiteouts, opaqueDirs, path)) {
+                        owner.put(path, i);
+                    }
                 }
-                long size = TYPE_FILE.equals(type)
-                        && Files.isRegularFile(physical, LinkOption.NOFOLLOW_LINKS)
-                                ? Files.size(physical)
-                                : 0;
-                return new Resolved(type, size, physical);
-        }
-        return new Resolved(TYPE_DIRECTORY, 0, null);
-    }
-
-    private boolean layerContainsDirectoryEntry(LayerRecord layer, String dirPath, String prefix) {
-        List<String> paths = layer.getPaths();
-        if (paths.contains(dirPath)) {
-            return true;
-        }
-        for (String candidate : paths) {
-            if (candidate.startsWith(prefix)) {
-                return true;
+                whiteouts.addAll(layer.getWhiteouts());
+                opaqueDirs.addAll(layer.getOpaqueDirs());
             }
+            return new MergedView(owner);
         }
-        return false;
-    }
 
-    private boolean removedByLayer(LayerRecord layer, String path) {
-        if (layer.getWhiteouts().contains(path)) {
-            return true;
-        }
-        return false;
-    }
-
-    private boolean opaqueIn(LayerRecord layer, String childPath) {
-        for (String opaqueDir : layer.getOpaqueDirs()) {
-            if (childPath.startsWith(opaqueDir + "/")) {
-                return true;
+        private static boolean isHidden(Set<String> whiteouts, Set<String> opaqueDirs,
+                String path) {
+            String current = path;
+            while (true) {
+                if (whiteouts.contains(current)) {
+                    return true;
+                }
+                int slash = current.lastIndexOf('/');
+                if (slash < 0) {
+                    break;
+                }
+                current = current.substring(0, slash);
             }
+            current = path;
+            while (true) {
+                int slash = current.lastIndexOf('/');
+                if (slash < 0) {
+                    break;
+                }
+                current = current.substring(0, slash);
+                if (opaqueDirs.contains(current)) {
+                    return true;
+                }
+            }
+            return false;
         }
-        return false;
+
+        Integer owner(String path) {
+            return ownerByPath.get(path);
+        }
+
+        Set<String> paths() {
+            return ownerByPath.keySet();
+        }
+
+        boolean hasVisibleDescendant(String dirPath) {
+            if (nonEmptyDirs == null) {
+                Set<String> dirs = new HashSet<>();
+                for (String path : ownerByPath.keySet()) {
+                    String current = path;
+                    while (true) {
+                        int slash = current.lastIndexOf('/');
+                        if (slash < 0) {
+                            break;
+                        }
+                        current = current.substring(0, slash);
+                        if (!dirs.add(current)) {
+                            break;
+                        }
+                    }
+                }
+                nonEmptyDirs = dirs;
+            }
+            return nonEmptyDirs.contains(dirPath);
+        }
     }
 
     private static String entryType(Path path) {
